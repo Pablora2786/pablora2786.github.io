@@ -81,7 +81,7 @@ if (listing) {
         tx.object(CLOCK),
       ],
     });
-    tx.transferObjects([got], SENDER);
+    tx.transferObjects([got, paid], SENDER);
     return tx;
   }));
 }

@@ -21,6 +21,16 @@ import { SITE_NAME } from './lib/constants';
 import { useSignAndExecuteTransaction } from '@mysten/dapp-kit';
 import type { Transaction } from '@mysten/sui/transactions';
 
+
+/** Keep SUIS pinned first in any tick list shown in the UI. */
+function pinSuisFirst<T extends { tick: string }>(list: T[]): T[] {
+  return [...list].sort((a, b) => {
+    if (a.tick === 'SUIS') return -1;
+    if (b.tick === 'SUIS') return 1;
+    return a.tick.localeCompare(b.tick);
+  });
+}
+
 type Tab = 'ticks' | 'deploy' | 'mine' | 'market';
 
 type Pending = {
@@ -80,7 +90,7 @@ export default function App() {
             startTimeMs: x.startTimeMs == null ? null : BigInt(x.startTimeMs),
             totalTx: x.totalTx == null ? null : BigInt(x.totalTx),
           }));
-          setTicks(mapped);
+          setTicks(pinSuisFirst(mapped));
           setLoadingTicks(false);
           if (!selected) {
             const suis = mapped.find((x: any) => x.tick === 'SUIS');
@@ -91,7 +101,7 @@ export default function App() {
         /* ignore snapshot miss */
       }
       const t = await loadAllTicks();
-      setTicks(t);
+      setTicks(pinSuisFirst(t));
       if (!selected && t.length) {
         const suis = t.find((x) => x.tick === 'SUIS');
         setSelected(suis || t[0]);
@@ -194,7 +204,12 @@ export default function App() {
           <span className="logo">{SITE_NAME}</span>
           <span className="tag">Mainnet</span>
         </div>
-        <nav className="nav">
+        <div className="header-actions">
+          <ConnectButton connectText="连接钱包" />
+        </div>
+      </header>
+      <nav className="tabbar" aria-label="主导航">
+        <div className="tabbar-inner">
           {(
             [
               ['ticks', '铭文列表'],
@@ -205,15 +220,15 @@ export default function App() {
           ).map(([k, label]) => (
             <button
               key={k}
-              className={`nav-btn ${tab === k ? 'active' : ''}`}
+              type="button"
+              className={`tab-btn ${tab === k ? 'active' : ''}`}
               onClick={() => setTab(k)}
             >
               {label}
             </button>
           ))}
-        </nav>
-        <ConnectButton connectText="连接钱包" />
-      </header>
+        </div>
+      </nav>
 
       <main className="main">
         <section className="hero">
@@ -570,13 +585,11 @@ export default function App() {
                     if (t) setSelected(t);
                   }}
                 >
-                  {ticks
-                    .filter((t) => t.marketId)
-                    .map((t) => (
-                      <option key={t.tick} value={t.tick}>
-                        {t.tick}
-                      </option>
-                    ))}
+                  {pinSuisFirst(ticks.filter((t) => t.marketId)).map((t) => (
+                    <option key={t.tick} value={t.tick}>
+                      {t.tick}
+                    </option>
+                  ))}
                   {ticks.filter((t) => t.marketId).length === 0 && (
                     <option value="SUIS">SUIS</option>
                   )}
@@ -593,8 +606,10 @@ export default function App() {
             {!selected?.marketId && <div className="card muted">该铭文没有已注册的 Marketplace</div>}
             {loadingListings && <div className="card muted">加载挂单…</div>}
             {!loadingListings && selected?.marketId && (
-              <div className="table-wrap">
-                <table className="table">
+              <>
+              <div className="table-wrap market-table-wrap">
+                <div className="scroll-hint">左右滑动查看更多 →</div>
+                <table className="table market-table">
                   <thead>
                     <tr>
                       <th>对象</th>
@@ -675,6 +690,86 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+              <div className="market-cards">
+                {listings.length === 0 && <div className="card muted">暂无挂单</div>}
+                {listings.map((l) => (
+                  <div className="market-card" key={`card-${l.objectId}`}>
+                    <div className="market-card-row">
+                      <span className="muted">对象</span>
+                      <span className="mono">{shortAddr(l.objectId, 8)}</span>
+                    </div>
+                    <div className="market-card-grid">
+                      <div>
+                        <div className="muted">数量</div>
+                        <div>{formatAmount(l.amount)}</div>
+                      </div>
+                      <div>
+                        <div className="muted">单价</div>
+                        <div>{mistToSui(l.unitPrice, 6)} SUI</div>
+                      </div>
+                      <div>
+                        <div className="muted">总价</div>
+                        <div className="price-strong">{mistToSui(l.totalPrice, 4)} SUI</div>
+                      </div>
+                    </div>
+                    <div className="market-card-row">
+                      <span className="muted">卖家</span>
+                      <span className="mono">{shortAddr(l.seller)}</span>
+                    </div>
+                    <div className="market-card-actions">
+                      <button
+                        className="btn small primary"
+                        disabled={!account}
+                        onClick={() =>
+                          ask({
+                            title: `购买 ${selected.tick}`,
+                            summary: (
+                              <ul className="summary">
+                                <li>对象：{l.objectId}</li>
+                                <li>数量：{formatAmount(l.amount)}</li>
+                                <li>单价：{mistToSui(l.unitPrice, 6)} SUI</li>
+                                <li>总价：{mistToSui(l.totalPrice, 4)} SUI</li>
+                                <li>市场费率约 2%（合约内部分配）</li>
+                              </ul>
+                            ),
+                            build: () =>
+                              buildBuyTxTo({
+                                marketId: selected.marketId!,
+                                objectId: l.objectId,
+                                unitPriceMist: l.unitPrice,
+                                totalPriceMist: l.totalPrice,
+                                buyer: account!.address,
+                              }),
+                          })
+                        }
+                      >
+                        购买
+                      </button>
+                      {account && l.seller.toLowerCase() === account.address.toLowerCase() && (
+                        <button
+                          className="btn small"
+                          onClick={() =>
+                            ask({
+                              title: '下架',
+                              summary: (
+                                <ul className="summary">
+                                  <li>对象：{l.objectId}</li>
+                                  <li>单价：{mistToSui(l.unitPrice, 6)} SUI</li>
+                                </ul>
+                              ),
+                              build: () =>
+                                buildDelistTx(selected.marketId!, l.objectId, l.unitPrice),
+                            })
+                          }
+                        >
+                          下架
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              </>
             )}
           </section>
         )}

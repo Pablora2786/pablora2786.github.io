@@ -115,7 +115,11 @@ export async function loadAllTicks(): Promise<TickInfo[]> {
     results.push(...part);
     await new Promise((r) => setTimeout(r, 150));
   }
-  results.sort((a, b) => a.tick.localeCompare(b.tick));
+  results.sort((a, b) => {
+    if (a.tick === 'SUIS') return -1;
+    if (b.tick === 'SUIS') return 1;
+    return a.tick.localeCompare(b.tick);
+  });
   return results;
 }
 
