@@ -22,6 +22,8 @@ export type HoldersSnapshot = {
     objects: number;
   };
   holders: HolderRow[];
+  complete?: boolean;
+  coverage?: unknown;
 };
 
 type Props = {
@@ -105,13 +107,14 @@ export function HoldersPanel({ tick }: Props) {
       {!loading && !err && data && (
         <>
           <p className="hint">
-            更新于 {formatShanghai(BigInt(Date.parse(data.updatedAt)))}（北京时间）· 共{' '}
+            更新于 {formatShanghai(BigInt(Date.parse(data.updatedAt)))} · 共{' '}
             {data.holderCount.toLocaleString()} 个地址 · 扫描对象 {data.scannedObjects.toLocaleString()}
+            {data.complete === false ? ' · 快照扫描未完成（双向分页合并中）' : ' · 完整快照'}
             {data.marketEscrow ? (
               <>
                 {' '}
-                · 市场托管（已挂单，不计入榜单）{formatAmount(BigInt(data.marketEscrow.amount))} /{' '}
-                {data.marketEscrow.objects} 个对象
+                · 市场托管/挂单对象已排除：{formatAmount(BigInt(data.marketEscrow.amount))}（
+                {data.marketEscrow.objects} 个）
               </>
             ) : null}
           </p>
