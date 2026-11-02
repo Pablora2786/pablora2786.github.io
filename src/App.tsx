@@ -1,0 +1,701 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { ConnectButton, useCurrentAccount } from '@mysten/dapp-kit';
+import { TickList } from './components/TickList';
+import { ConfirmModal } from './components/ConfirmModal';
+import type { TickInfo, MovescriptionHolding, MarketListing } from './lib/sui';
+import {
+  loadAllTicks,
+  loadOwnedMovescriptions,
+  loadFloorListings,
+  buildDeployTx,
+  buildMintTickNameTx,
+  buildMintTx,
+  buildTransferTx,
+  buildListTx,
+  buildDelistTx,
+  buildBuyTxTo,
+  dryRun,
+} from './lib/sui';
+import { formatAmount, formatShanghai, isValidSuiAddress, mistToSui, shortAddr } from './lib/format';
+import { SITE_NAME } from './lib/constants';
+import { useSignAndExecuteTransaction } from '@mysten/dapp-kit';
+import type { Transaction } from '@mysten/sui/transactions';
+
+type Tab = 'ticks' | 'deploy' | 'mine' | 'market';
+
+type Pending = {
+  title: string;
+  summary: React.ReactNode;
+  build: () => Transaction;
+};
+
+export default function App() {
+  const account = useCurrentAccount();
+  const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
+
+  const [tab, setTab] = useState<Tab>('ticks');
+  const [ticks, setTicks] = useState<TickInfo[]>([]);
+  const [loadingTicks, setLoadingTicks] = useState(true);
+  const [selected, setSelected] = useState<TickInfo | null>(null);
+  const [holdings, setHoldings] = useState<MovescriptionHolding[]>([]);
+  const [loadingMine, setLoadingMine] = useState(false);
+  const [listings, setListings] = useState<MarketListing[]>([]);
+  const [loadingListings, setLoadingListings] = useState(false);
+
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  // deploy form (requires burning a TICK-name Movescription)
+  const [dTickObj, setDTickObj] = useState('');
+  const [dSupply, setDSupply] = useState('21000000');
+  const [dEpochs, setDEpochs] = useState('1000');
+  const [dInitSui, setDInitSui] = useState('0');
+  const [dStart, setDStart] = useState(() => String(Date.now()));
+  const [dNewName, setDNewName] = useState('');
+  const [dMoveObj, setDMoveObj] = useState('');
+
+  // mint
+  const [mintMist, setMintMist] = useState('100000000'); // 0.1 SUI
+
+  // transfer / list
+  const [xferTo, setXferTo] = useState('');
+  const [listPrice, setListPrice] = useState('1000'); // mist per unit
+
+  const refreshTicks = useCallback(async () => {
+    setLoadingTicks(true);
+    setErr(null);
+    try {
+      // Prefer bundled snapshot for instant UI; refresh live in background when possible.
+      try {
+        const snap = await fetch(`${import.meta.env.BASE_URL}ticks-snapshot.json`).then((r) => r.json());
+        if (snap?.ticks?.length) {
+          const mapped = snap.ticks.map((x: any) => ({
+            ...x,
+            totalSupply: BigInt(x.totalSupply),
+            currentSupply: BigInt(x.currentSupply),
+            remain: BigInt(x.remain),
+            mintFee: x.mintFee == null ? null : BigInt(x.mintFee),
+            startTimeMs: x.startTimeMs == null ? null : BigInt(x.startTimeMs),
+            totalTx: x.totalTx == null ? null : BigInt(x.totalTx),
+          }));
+          setTicks(mapped);
+          setLoadingTicks(false);
+          if (!selected) {
+            const suis = mapped.find((x: any) => x.tick === 'SUIS');
+            setSelected(suis || mapped[0]);
+          }
+        }
+      } catch {
+        /* ignore snapshot miss */
+      }
+      const t = await loadAllTicks();
+      setTicks(t);
+      if (!selected && t.length) {
+        const suis = t.find((x) => x.tick === 'SUIS');
+        setSelected(suis || t[0]);
+      }
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoadingTicks(false);
+    }
+  }, [selected]);
+
+  useEffect(() => {
+    refreshTicks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const refreshMine = useCallback(async () => {
+    if (!account) {
+      setHoldings([]);
+      return;
+    }
+    setLoadingMine(true);
+    try {
+      setHoldings(await loadOwnedMovescriptions(account.address));
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoadingMine(false);
+    }
+  }, [account]);
+
+  useEffect(() => {
+    if (tab === 'mine' || tab === 'market' || tab === 'deploy') refreshMine();
+  }, [tab, refreshMine]);
+
+  const refreshListings = useCallback(async (marketId: string | null) => {
+    if (!marketId) {
+      setListings([]);
+      return;
+    }
+    setLoadingListings(true);
+    try {
+      setListings(await loadFloorListings(marketId, 0, 30));
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+      setListings([]);
+    } finally {
+      setLoadingListings(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === 'market' && selected?.marketId) refreshListings(selected.marketId);
+  }, [tab, selected, refreshListings]);
+
+  const grouped = useMemo(() => {
+    const m = new Map<string, MovescriptionHolding[]>();
+    for (const h of holdings) {
+      const arr = m.get(h.tick) || [];
+      arr.push(h);
+      m.set(h.tick, arr);
+    }
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [holdings]);
+
+  function ask(p: Pending) {
+    setErr(null);
+    setPending(p);
+  }
+
+  async function confirmSign() {
+    if (!pending || !account) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const tx = pending.build();
+      tx.setSender(account.address);
+      const dr = await dryRun(tx, account.address);
+      if (dr.status !== 'success') {
+        throw new Error(dr.error || '链上模拟失败，已取消签名');
+      }
+      // rebuild because previous build was consumed
+      const tx2 = pending.build();
+      const res = await signAndExecute({ transaction: tx2 });
+      setToast(`交易已提交：${res.digest}`);
+      setPending(null);
+      await Promise.all([refreshMine(), refreshTicks()]);
+      if (selected?.marketId) refreshListings(selected.marketId);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="page">
+      <header className="header">
+        <div className="brand">
+          <span className="logo">{SITE_NAME}</span>
+          <span className="tag">Mainnet</span>
+        </div>
+        <nav className="nav">
+          {(
+            [
+              ['ticks', '铭文列表'],
+              ['deploy', '创建铭文'],
+              ['mine', '我的铭文'],
+              ['market', '市场'],
+            ] as [Tab, string][]
+          ).map(([k, label]) => (
+            <button
+              key={k}
+              className={`nav-btn ${tab === k ? 'active' : ''}`}
+              onClick={() => setTab(k)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <ConnectButton connectText="连接钱包" />
+      </header>
+
+      <main className="main">
+        <section className="hero">
+          <h1>{SITE_NAME}</h1>
+          <p className="subtitle">简洁的链上铭文浏览器与交易面板</p>
+        </section>
+
+        {err && (
+          <div className="banner error" onClick={() => setErr(null)}>
+            {err}
+          </div>
+        )}
+        {toast && (
+          <div className="banner ok" onClick={() => setToast(null)}>
+            {toast}
+          </div>
+        )}
+
+        {tab === 'ticks' && (
+          <section className="section">
+            <div className="section-head">
+              <h2>铭文列表</h2>
+              <button className="btn ghost small" onClick={refreshTicks} disabled={loadingTicks}>
+                刷新
+              </button>
+            </div>
+            <TickList
+              ticks={ticks}
+              loading={loadingTicks}
+              selected={selected?.tick}
+              onSelect={(t) => {
+                setSelected(t);
+              }}
+            />
+            {selected && (
+              <div className="card detail">
+                <h3>{selected.tick}</h3>
+                <dl className="grid-dl">
+                  <div>
+                    <dt>总量</dt>
+                    <dd>{formatAmount(selected.totalSupply)}</dd>
+                  </div>
+                  <div>
+                    <dt>已铸造</dt>
+                    <dd>{formatAmount(selected.currentSupply)}</dd>
+                  </div>
+                  <div>
+                    <dt>剩余</dt>
+                    <dd>{formatAmount(selected.remain)}</dd>
+                  </div>
+                  <div>
+                    <dt>创建时间</dt>
+                    <dd>{formatShanghai(selected.startTimeMs ?? undefined)}</dd>
+                  </div>
+                  <div>
+                    <dt>铸造费</dt>
+                    <dd>
+                      {selected.mintFee == null
+                        ? '—'
+                        : selected.mintFee === 0n
+                          ? '0 SUI'
+                          : `${mistToSui(selected.mintFee)} SUI`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>记录对象</dt>
+                    <dd className="mono">{shortAddr(selected.recordId, 10)}</dd>
+                  </div>
+                </dl>
+                <div className="row gap wrap">
+                  {selected.remain === 0n ? (
+                    <button className="btn" disabled>
+                      已售罄，无法铸造
+                    </button>
+                  ) : (
+                    <>
+                      <label className="field inline">
+                        锁定 SUI (MIST)
+                        <input value={mintMist} onChange={(e) => setMintMist(e.target.value)} />
+                      </label>
+                      <button
+                        className="btn primary"
+                        disabled={!account}
+                        onClick={() =>
+                          ask({
+                            title: `铸造 ${selected.tick}`,
+                            summary: (
+                              <ul className="summary">
+                                <li>Tick：{selected.tick}</li>
+                                <li>锁定 SUI：{mistToSui(mintMist)} SUI</li>
+                                <li>剩余可铸：{formatAmount(selected.remain)}</li>
+                                <li>调用：{selected.isV2 ? 'epoch_bus_factory::mint' : 'movescription::mint'}</li>
+                              </ul>
+                            ),
+                            build: () =>
+                              buildMintTx({
+                                recordId: selected.recordId,
+                                isV2: selected.isV2,
+                                mintFactory: selected.mintFactory,
+                                lockedSuiMist: BigInt(mintMist || '0'),
+                              }),
+                          })
+                        }
+                      >
+                        铸造
+                      </button>
+                    </>
+                  )}
+                  {!account && <span className="hint">连接钱包后可铸造</span>}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {tab === 'deploy' && (
+          <section className="section narrow">
+            <h2>创建铭文</h2>
+            <p className="hint">
+              旧版 <code>movescription::deploy</code> 已废弃。请使用{' '}
+              <code>epoch_bus_factory::deploy</code>：消耗一个 <strong>TICK</strong>{' '}
+              名称铭文对象来创建新 tick（名称写在该对象 metadata 中）。
+            </p>
+            <div className="card form">
+              <label className="field">
+                TICK 名称铭文对象 ID
+                <select
+                  className="select"
+                  value={dTickObj}
+                  onChange={(e) => setDTickObj(e.target.value)}
+                >
+                  <option value="">选择钱包中的 TICK 对象</option>
+                  {holdings
+                    .filter((h) => h.tick === 'TICK')
+                    .map((h) => (
+                      <option key={h.objectId} value={h.objectId}>
+                        {h.objectId.slice(0, 10)}…{h.objectId.slice(-6)}
+                      </option>
+                    ))}
+                </select>
+                <input
+                  value={dTickObj}
+                  onChange={(e) => setDTickObj(e.target.value.trim())}
+                  placeholder="或粘贴对象 ID"
+                />
+              </label>
+              <label className="field">
+                总供应量
+                <input value={dSupply} onChange={(e) => setDSupply(e.target.value)} />
+              </label>
+              <label className="field">
+                Epoch 数量（≥120）
+                <input value={dEpochs} onChange={(e) => setDEpochs(e.target.value)} />
+              </label>
+              <label className="field">
+                初始锁定 SUI (MIST)
+                <input value={dInitSui} onChange={(e) => setDInitSui(e.target.value)} />
+              </label>
+              <label className="field">
+                开始时间 (ms)
+                <input value={dStart} onChange={(e) => setDStart(e.target.value)} />
+              </label>
+              <button
+                className="btn primary"
+                disabled={!account || !dTickObj}
+                onClick={() =>
+                  ask({
+                    title: '部署新铭文',
+                    summary: (
+                      <ul className="summary">
+                        <li>将销毁/消耗 TICK 名称对象：{dTickObj}</li>
+                        <li>总量：{dSupply}</li>
+                        <li>Epochs：{dEpochs}</li>
+                        <li>初始锁定：{mistToSui(dInitSui || '0')} SUI</li>
+                        <li>开始：{formatShanghai(dStart)}</li>
+                        <li>调用：epoch_bus_factory::deploy</li>
+                      </ul>
+                    ),
+                    build: () =>
+                      buildDeployTx({
+                        tickNameObjectId: dTickObj,
+                        totalSupply: BigInt(dSupply || '0'),
+                        initLockedSui: BigInt(dInitSui || '0'),
+                        startTimeMs: BigInt(dStart || '0'),
+                        epochCount: BigInt(dEpochs || '0'),
+                      }),
+                  })
+                }
+              >
+                创建铭文
+              </button>
+            </div>
+            <div className="card form" style={{ marginTop: 16 }}>
+              <h3>可选：先铸造 TICK 名称</h3>
+              <p className="hint">
+                若还没有名称对象，可调用 <code>tick_factory::mint</code>（需锁定一枚 MOVE
+                铭文）。
+              </p>
+              <label className="field">
+                新 Tick 名称
+                <input
+                  value={dNewName}
+                  onChange={(e) => setDNewName(e.target.value.toUpperCase())}
+                  maxLength={32}
+                />
+              </label>
+              <label className="field">
+                MOVE 铭文对象 ID
+                <input
+                  value={dMoveObj}
+                  onChange={(e) => setDMoveObj(e.target.value.trim())}
+                  placeholder="tick 为 MOVE 的对象"
+                />
+              </label>
+              <button
+                className="btn"
+                disabled={!account || !dNewName || !dMoveObj}
+                onClick={() =>
+                  ask({
+                    title: `铸造 TICK 名称 ${dNewName}`,
+                    summary: (
+                      <ul className="summary">
+                        <li>名称：{dNewName}</li>
+                        <li>锁定 MOVE 对象：{dMoveObj}</li>
+                        <li>调用：tick_factory::mint</li>
+                      </ul>
+                    ),
+                    build: () =>
+                      buildMintTickNameTx({ moveObjectId: dMoveObj, tickName: dNewName }),
+                  })
+                }
+              >
+                铸造名称铭文
+              </button>
+            </div>
+          </section>
+        )}
+
+        {tab === 'mine' && (
+          <section className="section">
+            <div className="section-head">
+              <h2>我的铭文</h2>
+              <button className="btn ghost small" onClick={refreshMine} disabled={!account || loadingMine}>
+                刷新
+              </button>
+            </div>
+            {!account && <div className="card muted">请先连接钱包</div>}
+            {account && loadingMine && <div className="card muted">加载中…</div>}
+            {account && !loadingMine && holdings.length === 0 && (
+              <div className="card muted">当前钱包没有 Movescription 铭文对象</div>
+            )}
+            {grouped.map(([tick, items]) => {
+              const total = items.reduce((s, x) => s + x.amount, 0n);
+              const marketId = ticks.find((t) => t.tick === tick)?.marketId || null;
+              return (
+                <div className="card" key={tick}>
+                  <div className="section-head">
+                    <h3>
+                      {tick}{' '}
+                      <span className="muted">合计 {formatAmount(total)}</span>
+                    </h3>
+                  </div>
+                  <ul className="obj-list">
+                    {items.map((h) => (
+                      <li key={h.objectId}>
+                        <div>
+                          <div className="mono">{shortAddr(h.objectId, 10)}</div>
+                          <div className="muted">数量 {formatAmount(h.amount)}</div>
+                        </div>
+                        <div className="row gap wrap">
+                          <button
+                            className="btn small"
+                            onClick={() => {
+                              const to = xferTo || account!.address;
+                              if (!isValidSuiAddress(to)) {
+                                setErr('请输入合法的 0x + 64 位十六进制地址');
+                                return;
+                              }
+                              ask({
+                                title: '转账铭文',
+                                summary: (
+                                  <ul className="summary">
+                                    <li>对象：{h.objectId}</li>
+                                    <li>Tick：{h.tick}</li>
+                                    <li>数量：{formatAmount(h.amount)}</li>
+                                    <li>收款地址：{to}</li>
+                                  </ul>
+                                ),
+                                build: () => buildTransferTx(h.objectId, to),
+                              });
+                            }}
+                          >
+                            转账
+                          </button>
+                          <button
+                            className="btn small"
+                            disabled={!marketId}
+                            title={marketId ? '' : '该 tick 暂无已知市场'}
+                            onClick={() => {
+                              if (!marketId) return;
+                              const unit = BigInt(listPrice || '0');
+                              ask({
+                                title: `挂单 ${h.tick}`,
+                                summary: (
+                                  <ul className="summary">
+                                    <li>对象：{h.objectId}</li>
+                                    <li>单价：{mistToSui(unit)} SUI / 单位</li>
+                                    <li>总价：{mistToSui(unit * h.amount)} SUI</li>
+                                    <li>市场：{shortAddr(marketId, 10)}</li>
+                                  </ul>
+                                ),
+                                build: () => buildListTx(marketId, h.objectId, unit),
+                              });
+                            }}
+                          >
+                            挂单
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+            {account && (
+              <div className="card form">
+                <label className="field">
+                  转账目标地址（留空则转给自己，用于测试）
+                  <input
+                    value={xferTo}
+                    onChange={(e) => setXferTo(e.target.value.trim())}
+                    placeholder={account.address}
+                  />
+                </label>
+                <label className="field">
+                  挂单单价（MIST / 单位）
+                  <input value={listPrice} onChange={(e) => setListPrice(e.target.value)} />
+                </label>
+              </div>
+            )}
+          </section>
+        )}
+
+        {tab === 'market' && (
+          <section className="section">
+            <div className="section-head">
+              <h2>市场 {selected ? `· ${selected.tick}` : ''}</h2>
+              <div className="row gap">
+                <select
+                  className="select"
+                  value={selected?.tick || ''}
+                  onChange={(e) => {
+                    const t = ticks.find((x) => x.tick === e.target.value);
+                    if (t) setSelected(t);
+                  }}
+                >
+                  {ticks
+                    .filter((t) => t.marketId)
+                    .map((t) => (
+                      <option key={t.tick} value={t.tick}>
+                        {t.tick}
+                      </option>
+                    ))}
+                  {ticks.filter((t) => t.marketId).length === 0 && (
+                    <option value="SUIS">SUIS</option>
+                  )}
+                </select>
+                <button
+                  className="btn ghost small"
+                  disabled={!selected?.marketId || loadingListings}
+                  onClick={() => selected?.marketId && refreshListings(selected.marketId)}
+                >
+                  刷新挂单
+                </button>
+              </div>
+            </div>
+            {!selected?.marketId && <div className="card muted">该铭文没有已注册的 Marketplace</div>}
+            {loadingListings && <div className="card muted">加载挂单…</div>}
+            {!loadingListings && selected?.marketId && (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>对象</th>
+                      <th>数量</th>
+                      <th>单价 (SUI)</th>
+                      <th>总价 (SUI)</th>
+                      <th>卖家</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {listings.map((l) => (
+                      <tr key={l.objectId}>
+                        <td className="mono">{shortAddr(l.objectId, 8)}</td>
+                        <td>{formatAmount(l.amount)}</td>
+                        <td>{mistToSui(l.unitPrice, 6)}</td>
+                        <td>{mistToSui(l.totalPrice, 4)}</td>
+                        <td className="mono">{shortAddr(l.seller)}</td>
+                        <td className="row gap">
+                          <button
+                            className="btn small primary"
+                            disabled={!account}
+                            onClick={() =>
+                              ask({
+                                title: `购买 ${selected.tick}`,
+                                summary: (
+                                  <ul className="summary">
+                                    <li>对象：{l.objectId}</li>
+                                    <li>数量：{formatAmount(l.amount)}</li>
+                                    <li>单价：{mistToSui(l.unitPrice, 6)} SUI</li>
+                                    <li>总价：{mistToSui(l.totalPrice, 4)} SUI</li>
+                                    <li>市场费率约 2%（合约内部分配）</li>
+                                  </ul>
+                                ),
+                                build: () =>
+                                  buildBuyTxTo({
+                                    marketId: selected.marketId!,
+                                    objectId: l.objectId,
+                                    unitPriceMist: l.unitPrice,
+                                    totalPriceMist: l.totalPrice,
+                                    buyer: account!.address,
+                                  }),
+                              })
+                            }
+                          >
+                            购买
+                          </button>
+                          {account && l.seller.toLowerCase() === account.address.toLowerCase() && (
+                            <button
+                              className="btn small"
+                              onClick={() =>
+                                ask({
+                                  title: '下架',
+                                  summary: (
+                                    <ul className="summary">
+                                      <li>对象：{l.objectId}</li>
+                                      <li>单价：{mistToSui(l.unitPrice, 6)} SUI</li>
+                                    </ul>
+                                  ),
+                                  build: () =>
+                                    buildDelistTx(selected.marketId!, l.objectId, l.unitPrice),
+                                })
+                              }
+                            >
+                              下架
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {listings.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="muted">
+                          暂无挂单
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        )}
+      </main>
+
+      <footer className="footer">
+        <p>
+          <strong>{SITE_NAME}</strong> 是独立的社区前端，仅与链上 Movescriptions
+          合约交互；与 SuiMint、Movescriptions 官方无隶属或合作关系。
+        </p>
+        <p className="muted">交易由你的钱包签名发送 · Mainnet · 不托管私钥</p>
+      </footer>
+
+      <ConfirmModal
+        open={!!pending}
+        title={pending?.title || ''}
+        summary={pending?.summary}
+        busy={busy}
+        onCancel={() => !busy && setPending(null)}
+        onConfirm={confirmSign}
+      />
+    </div>
+  );
+}
