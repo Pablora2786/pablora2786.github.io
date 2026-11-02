@@ -2,12 +2,12 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { SuiClientProvider, WalletProvider } from '@mysten/dapp-kit';
-import { SuiJsonRpcClient } from '@mysten/sui/jsonRpc';
 import { registerSlushWallet } from '@mysten/slush-wallet';
 import '@mysten/dapp-kit/dist/index.css';
 import './index.css';
 import App from './App';
-import { NETWORK, RPC_URL, SITE_NAME } from './lib/constants';
+import { NETWORK, SITE_NAME } from './lib/constants';
+import { client } from './lib/rpc';
 
 try {
   registerSlushWallet(SITE_NAME, {
@@ -18,12 +18,11 @@ try {
 }
 
 const queryClient = new QueryClient();
-const client = new SuiJsonRpcClient({ url: RPC_URL, network: NETWORK });
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <SuiClientProvider networks={{ mainnet: client }} defaultNetwork="mainnet">
+      <SuiClientProvider networks={{ [NETWORK]: client }} defaultNetwork={NETWORK}>
         <WalletProvider autoConnect>
           <App />
         </WalletProvider>

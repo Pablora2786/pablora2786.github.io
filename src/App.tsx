@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ConnectButton, useCurrentAccount } from '@mysten/dapp-kit';
 import { TickList } from './components/TickList';
 import { ConfirmModal } from './components/ConfirmModal';
+import { HoldersPanel } from './components/HoldersPanel';
 import type { TickInfo, MovescriptionHolding, MarketListing } from './lib/sui';
 import {
   loadAllTicks,
@@ -15,6 +16,7 @@ import {
   buildDelistTx,
   buildBuyTxTo,
   dryRun,
+  friendlyRpcError,
 } from './lib/sui';
 import { formatAmount, formatShanghai, isValidSuiAddress, mistToSui, shortAddr } from './lib/format';
 import { SITE_NAME } from './lib/constants';
@@ -31,7 +33,7 @@ function pinSuisFirst<T extends { tick: string }>(list: T[]): T[] {
   });
 }
 
-type Tab = 'ticks' | 'deploy' | 'mine' | 'market';
+type Tab = 'ticks' | 'deploy' | 'mine' | 'market' | 'holders';
 
 type Pending = {
   title: string;
@@ -51,6 +53,7 @@ export default function App() {
   const [loadingMine, setLoadingMine] = useState(false);
   const [listings, setListings] = useState<MarketListing[]>([]);
   const [loadingListings, setLoadingListings] = useState(false);
+  const [listingsError, setListingsError] = useState<string | null>(null);
 
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
@@ -73,11 +76,11 @@ export default function App() {
   const [xferTo, setXferTo] = useState('');
   const [listPrice, setListPrice] = useState('1000'); // mist per unit
 
-  const refreshTicks = useCallback(async () => {
+  const refreshTicks = useCallback(async (deep = false) => {
     setLoadingTicks(true);
     setErr(null);
     try {
-      // Prefer bundled snapshot for instant UI; refresh live in background when possible.
+      // Snapshot first — avoids flooding public RPC (429). Live crawl only on explicit deep refresh.
       try {
         const snap = await fetch(`${import.meta.env.BASE_URL}ticks-snapshot.json`).then((r) => r.json());
         if (snap?.ticks?.length) {
@@ -92,26 +95,31 @@ export default function App() {
           }));
           setTicks(pinSuisFirst(mapped));
           setLoadingTicks(false);
-          if (!selected) {
+          setSelected((prev) => {
+            if (prev) return prev;
             const suis = mapped.find((x: any) => x.tick === 'SUIS');
-            setSelected(suis || mapped[0]);
-          }
+            return suis || mapped[0];
+          });
         }
       } catch {
         /* ignore snapshot miss */
       }
-      const t = await loadAllTicks();
-      setTicks(pinSuisFirst(t));
-      if (!selected && t.length) {
-        const suis = t.find((x) => x.tick === 'SUIS');
-        setSelected(suis || t[0]);
+      if (deep) {
+        const live = await loadAllTicks({ deep: true });
+        setTicks(pinSuisFirst(live));
+        setSelected((prev) => {
+          if (prev) {
+            return live.find((x) => x.tick === prev.tick) || prev;
+          }
+          return live.find((x) => x.tick === 'SUIS') || live[0] || null;
+        });
       }
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(friendlyRpcError(e));
     } finally {
       setLoadingTicks(false);
     }
-  }, [selected]);
+  }, []);
 
   useEffect(() => {
     refreshTicks();
@@ -127,27 +135,32 @@ export default function App() {
     try {
       setHoldings(await loadOwnedMovescriptions(account.address));
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(friendlyRpcError(e));
     } finally {
       setLoadingMine(false);
     }
   }, [account]);
 
   useEffect(() => {
-    if (tab === 'mine' || tab === 'market' || tab === 'deploy') refreshMine();
+    if (tab === 'mine' || tab === 'deploy') refreshMine();
   }, [tab, refreshMine]);
 
-  const refreshListings = useCallback(async (marketId: string | null) => {
+  const refreshListings = useCallback(async (marketId: string | null, bypassCache = false) => {
     if (!marketId) {
       setListings([]);
+      setListingsError(null);
       return;
     }
     setLoadingListings(true);
+    setListingsError(null);
     try {
-      setListings(await loadFloorListings(marketId, 0, 30));
+      const rows = await loadFloorListings(marketId, 0, 30, { bypassCache });
+      setListings(rows);
     } catch (e: any) {
-      setErr(e?.message || String(e));
-      setListings([]);
+      const msg = friendlyRpcError(e);
+      setListingsError(msg);
+      setErr(msg);
+      // Keep previous listings if any; never pretend "暂无挂单" on failure
     } finally {
       setLoadingListings(false);
     }
@@ -191,7 +204,7 @@ export default function App() {
       await Promise.all([refreshMine(), refreshTicks()]);
       if (selected?.marketId) refreshListings(selected.marketId);
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(friendlyRpcError(e));
     } finally {
       setBusy(false);
     }
@@ -216,6 +229,7 @@ export default function App() {
               ['deploy', '创建铭文'],
               ['mine', '我的铭文'],
               ['market', '市场'],
+              ['holders', '持有者'],
             ] as [Tab, string][]
           ).map(([k, label]) => (
             <button
@@ -251,7 +265,7 @@ export default function App() {
           <section className="section">
             <div className="section-head">
               <h2>铭文列表</h2>
-              <button className="btn ghost small" onClick={refreshTicks} disabled={loadingTicks}>
+              <button className="btn ghost small" onClick={() => refreshTicks(true)} disabled={loadingTicks} title="从链上刷新（可能较慢）">
                 刷新
               </button>
             </div>
@@ -597,7 +611,7 @@ export default function App() {
                 <button
                   className="btn ghost small"
                   disabled={!selected?.marketId || loadingListings}
-                  onClick={() => selected?.marketId && refreshListings(selected.marketId)}
+                  onClick={() => selected?.marketId && refreshListings(selected.marketId, true)}
                 >
                   刷新挂单
                 </button>
@@ -605,7 +619,18 @@ export default function App() {
             </div>
             {!selected?.marketId && <div className="card muted">该铭文没有已注册的 Marketplace</div>}
             {loadingListings && <div className="card muted">加载挂单…</div>}
-            {!loadingListings && selected?.marketId && (
+            {!loadingListings && listingsError && (
+              <div className="card error-card">
+                <p>{listingsError}</p>
+                <button
+                  className="btn small primary"
+                  onClick={() => selected?.marketId && refreshListings(selected.marketId, true)}
+                >
+                  重试加载挂单
+                </button>
+              </div>
+            )}
+            {!loadingListings && !listingsError && selected?.marketId && (
               <>
               <div className="table-wrap market-table-wrap">
                 <div className="scroll-hint">左右滑动查看更多 →</div>
@@ -772,6 +797,10 @@ export default function App() {
               </>
             )}
           </section>
+        )}
+
+        {tab === 'holders' && (
+          <HoldersPanel tick={selected?.tick || 'SUIS'} />
         )}
       </main>
 

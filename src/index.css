@@ -228,3 +228,21 @@ code { font-size: 12px; background: #eee; padding: 1px 6px; border-radius: 6px; 
   .market-cards { display: none; }
   .market-table-wrap .scroll-hint { display: none; }
 }
+
+.error-card {
+  background: #ffe5e3; color: #b00020; display: flex; flex-direction: column; gap: 12px; align-items: flex-start;
+}
+.error-card p { margin: 0; }
+.addr-link { color: var(--primary); text-decoration: none; }
+.addr-link:hover { text-decoration: underline; }
+.pager { margin-top: 14px; justify-content: center; }
+.pill-rank {
+  display: inline-block; min-width: 36px; text-align: center;
+  background: #e8e8ed; border-radius: 999px; padding: 2px 8px; font-weight: 600; font-size: 12px;
+}
+.holders-cards { display: none; }
+
+@media (max-width: 720px) {
+  .holders-table-wrap { display: none; }
+  .holders-cards { display: block; }
+}

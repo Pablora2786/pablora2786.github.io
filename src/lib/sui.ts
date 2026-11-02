@@ -1,7 +1,7 @@
-import { SuiJsonRpcClient } from '@mysten/sui/jsonRpc';
 import { Transaction } from '@mysten/sui/transactions';
 import {
   CALL_PACKAGE,
+  CACHE_TTL_MS,
   CLOCK,
   DEPLOY_RECORD,
   DEPLOY_TABLE,
@@ -10,11 +10,18 @@ import {
   MARKET_TYPE_PACKAGE,
   MARKETPLACE_HOUSE,
   MOVESCRIPTION_TYPE,
-  RPC_URL,
   TYPE_PACKAGE,
 } from './constants';
+import {
+  cacheGet,
+  cacheSet,
+  client,
+  friendlyRpcError,
+  serializeBig,
+  withRetry,
+} from './rpc';
 
-export const client = new SuiJsonRpcClient({ url: RPC_URL, network: 'mainnet' });
+export { client, friendlyRpcError };
 
 export const TICK_RECORD_V2 =
   '0x1daf3c01d08c3068cee9419a8f3f542382d5adf72f4fb31fe1bd32c7187981a0';
@@ -54,28 +61,28 @@ function fieldsOf(obj: any): any {
   return obj?.content?.fields ?? obj?.data?.content?.fields ?? {};
 }
 
-async function withRetry<T>(fn: () => Promise<T>, tries = 5): Promise<T> {
-  let last: unknown;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      last = e;
-      const msg = String((e as any)?.message || e);
-      const backoff = 400 * Math.pow(2, i);
-      if (!/429|rate|timeout|503|502/i.test(msg) && i > 1) break;
-      await new Promise((r) => setTimeout(r, backoff));
+export async function loadAllTicks(opts?: { deep?: boolean }): Promise<TickInfo[]> {
+  const cacheKey = 'suirc20:ticks:v1';
+  if (!opts?.deep) {
+    const cached = cacheGet<any[]>(cacheKey, CACHE_TTL_MS);
+    if (cached?.length) {
+      return cached.map((x) => ({
+        ...x,
+        totalSupply: BigInt(x.totalSupply),
+        currentSupply: BigInt(x.currentSupply),
+        remain: BigInt(x.remain),
+        mintFee: x.mintFee == null ? null : BigInt(x.mintFee),
+        startTimeMs: x.startTimeMs == null ? null : BigInt(x.startTimeMs),
+        totalTx: x.totalTx == null ? null : BigInt(x.totalTx),
+      }));
     }
   }
-  throw last;
-}
 
-export async function loadAllTicks(): Promise<TickInfo[]> {
   const entries: { tick: string; dfId: string }[] = [];
   let cursor: string | null | undefined = null;
   do {
-    const page = await withRetry(() =>
-      client.getDynamicFields({
+    const page = await withRetry((c) =>
+      c.getDynamicFields({
         parentId: DEPLOY_TABLE,
         cursor: cursor ?? null,
         limit: 50,
@@ -86,14 +93,14 @@ export async function loadAllTicks(): Promise<TickInfo[]> {
       if (name) entries.push({ tick: name, dfId: df.objectId });
     }
     cursor = page.hasNextPage ? page.nextCursor : null;
+    await new Promise((r) => setTimeout(r, 80));
   } while (cursor);
 
-  // Resolve DF values in batches via multiGetObjects
   const resolved: { tick: string; recordId: string }[] = [];
-  for (let i = 0; i < entries.length; i += 20) {
-    const slice = entries.slice(i, i + 20);
-    const objs = await withRetry(() =>
-      client.multiGetObjects({
+  for (let i = 0; i < entries.length; i += 25) {
+    const slice = entries.slice(i, i + 25);
+    const objs = await withRetry((c) =>
+      c.multiGetObjects({
         ids: slice.map((s) => s.dfId),
         options: { showContent: true },
       }),
@@ -102,49 +109,65 @@ export async function loadAllTicks(): Promise<TickInfo[]> {
       const recordId = fieldsOf(o.data)?.value as string;
       if (recordId) resolved.push({ tick: slice[idx].tick, recordId });
     });
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 200));
   }
 
-  const markets = await loadMarketIndex();
+  // Prefer seeded markets; optional house crawl only in deep mode
+  const markets = opts?.deep ? await loadMarketIndex() : { ...KNOWN_MARKETS };
   const results: TickInfo[] = [];
-  for (let i = 0; i < resolved.length; i += 8) {
-    const slice = resolved.slice(i, i + 8);
-    const part = await Promise.all(
-      slice.map((e) => withRetry(() => loadTickDetail(e.tick, e.recordId, markets))),
+  // Batch record objects
+  for (let i = 0; i < resolved.length; i += 20) {
+    const slice = resolved.slice(i, i + 20);
+    const objs = await withRetry((c) =>
+      c.multiGetObjects({
+        ids: slice.map((s) => s.recordId),
+        options: { showContent: true, showType: true },
+      }),
     );
-    results.push(...part);
-    await new Promise((r) => setTimeout(r, 150));
+    objs.forEach((obj, idx) => {
+      const e = slice[idx];
+      results.push(parseTickDetail(e.tick, e.recordId, obj, markets));
+    });
+    await new Promise((r) => setTimeout(r, 200));
   }
   results.sort((a, b) => {
     if (a.tick === 'SUIS') return -1;
     if (b.tick === 'SUIS') return 1;
     return a.tick.localeCompare(b.tick);
   });
+  cacheSet(cacheKey, serializeBig(results));
   return results;
 }
 
 async function loadMarketIndex(): Promise<Record<string, string>> {
   const map: Record<string, string> = { ...KNOWN_MARKETS };
   try {
-    const house = await client.getObject({
-      id: MARKETPLACE_HOUSE,
-      options: { showContent: true },
-    });
+    const house = await withRetry((c) =>
+      c.getObject({
+        id: MARKETPLACE_HOUSE,
+        options: { showContent: true },
+      }),
+    );
     const infoTable = fieldsOf(house.data)?.market_info?.fields?.id?.id as string | undefined;
     if (!infoTable) return map;
     let cursor: string | null | undefined = null;
     do {
-      const page = await client.getDynamicFields({
-        parentId: infoTable,
-        cursor: cursor ?? null,
-        limit: 50,
-      });
-      for (const df of page.data) {
+      const page = await withRetry((c) =>
+        c.getDynamicFields({
+          parentId: infoTable,
+          cursor: cursor ?? null,
+          limit: 50,
+        }),
+      );
+      const dfIds = page.data.map((df) => df.objectId);
+      const dfObjs = dfIds.length
+        ? await withRetry((c) => c.multiGetObjects({ ids: dfIds, options: { showContent: true } }))
+        : [];
+      page.data.forEach((df, i) => {
         const tick = (df.name as any)?.value as string;
-        const dfObj = await client.getObject({ id: df.objectId, options: { showContent: true } });
-        const marketId = fieldsOf(dfObj.data)?.value as string;
+        const marketId = fieldsOf(dfObjs[i]?.data)?.value as string;
         if (tick && marketId) map[tick.toUpperCase()] = marketId;
-      }
+      });
       cursor = page.hasNextPage ? page.nextCursor : null;
     } while (cursor);
   } catch {
@@ -153,14 +176,14 @@ async function loadMarketIndex(): Promise<Record<string, string>> {
   return map;
 }
 
-async function loadTickDetail(
+function parseTickDetail(
   tick: string,
   recordId: string,
+  obj: any,
   markets: Record<string, string>,
-): Promise<TickInfo> {
-  const obj = await client.getObject({ id: recordId, options: { showContent: true, showType: true } });
-  const typ = obj.data?.type || '';
-  const f = fieldsOf(obj.data);
+): TickInfo {
+  const typ = obj?.data?.type || '';
+  const f = fieldsOf(obj?.data);
   const isV2 = typ.includes('TickRecordV2');
   let totalSupply = BigInt(f.total_supply || 0);
   let currentSupply = 0n;
@@ -175,18 +198,6 @@ async function loadTickDetail(
     currentSupply = BigInt(stat.current_supply || 0);
     remain = BigInt(stat.remain || 0);
     totalTx = BigInt(stat.total_transactions || 0);
-    try {
-      const dfs = await client.getDynamicFields({ parentId: recordId, limit: 10 });
-      for (const df of dfs.data) {
-        const dfo = await client.getObject({ id: df.objectId, options: { showContent: true } });
-        const val = fieldsOf(dfo.data)?.value;
-        const vf = val?.fields || val;
-        if (vf?.start_time_ms != null) startTimeMs = BigInt(vf.start_time_ms);
-        if (vf?.init_locked_sui != null && mintFee == null) mintFee = BigInt(vf.init_locked_sui);
-      }
-    } catch {
-      /* optional */
-    }
   } else {
     currentSupply = BigInt(f.current_supply || 0);
     remain = BigInt(f.remain || 0);
@@ -212,13 +223,15 @@ export async function loadOwnedMovescriptions(owner: string): Promise<Movescript
   const out: MovescriptionHolding[] = [];
   let cursor: string | null | undefined = null;
   do {
-    const page = await client.getOwnedObjects({
-      owner,
-      cursor: cursor ?? null,
-      limit: 50,
-      filter: { StructType: MOVESCRIPTION_TYPE },
-      options: { showContent: true },
-    });
+    const page = await withRetry((c) =>
+      c.getOwnedObjects({
+        owner,
+        cursor: cursor ?? null,
+        limit: 50,
+        filter: { StructType: MOVESCRIPTION_TYPE },
+        options: { showContent: true },
+      }),
+    );
     for (const row of page.data) {
       const f = fieldsOf(row.data);
       const accRaw = f.acc;
@@ -242,30 +255,51 @@ export async function loadOwnedMovescriptions(owner: string): Promise<Movescript
 export async function loadFloorListings(
   marketId: string,
   from = 0,
-  limit = 20,
+  limit = 30,
+  opts?: { bypassCache?: boolean },
 ): Promise<MarketListing[]> {
-  const tx = new Transaction();
-  tx.moveCall({
-    target: `${MARKET_CALL_PACKAGE}::market::floor_listing`,
-    arguments: [tx.object(marketId), tx.pure.u64(from), tx.pure.u64(limit)],
-  });
-  const r = await client.devInspectTransactionBlock({
-    sender: '0x0000000000000000000000000000000000000000000000000000000000000000',
-    transactionBlock: tx,
-  });
-  const ev = r.events?.find((e) => e.type.includes('FloorPriceEvent'))?.parsedJson as any;
-  if (!ev?.object_id) return [];
-  const list: MarketListing[] = [];
-  for (let i = 0; i < ev.object_id.length; i++) {
-    list.push({
-      objectId: ev.object_id[i],
-      amount: BigInt(ev.amt[i]),
-      unitPrice: BigInt(ev.unit_price[i]),
-      totalPrice: BigInt(ev.price[i]),
-      seller: ev.seller[i],
-      acc: BigInt(ev.acc[i] || 0),
-    });
+  const cacheKey = `suirc20:floor:${marketId}:${from}:${limit}`;
+  if (!opts?.bypassCache) {
+    const cached = cacheGet<any[]>(cacheKey, CACHE_TTL_MS);
+    if (cached) {
+      return cached.map((x) => ({
+        objectId: x.objectId,
+        amount: BigInt(x.amount),
+        unitPrice: BigInt(x.unitPrice),
+        totalPrice: BigInt(x.totalPrice),
+        seller: x.seller,
+        acc: BigInt(x.acc || 0),
+      }));
+    }
   }
+
+  const list = await withRetry(async (c) => {
+    const tx = new Transaction();
+    tx.moveCall({
+      target: `${MARKET_CALL_PACKAGE}::market::floor_listing`,
+      arguments: [tx.object(marketId), tx.pure.u64(from), tx.pure.u64(limit)],
+    });
+    const r = await c.devInspectTransactionBlock({
+      sender: '0x0000000000000000000000000000000000000000000000000000000000000000',
+      transactionBlock: tx,
+    });
+    const ev = r.events?.find((e) => e.type.includes('FloorPriceEvent'))?.parsedJson as any;
+    if (!ev?.object_id) return [] as MarketListing[];
+    const out: MarketListing[] = [];
+    for (let i = 0; i < ev.object_id.length; i++) {
+      out.push({
+        objectId: ev.object_id[i],
+        amount: BigInt(ev.amt[i]),
+        unitPrice: BigInt(ev.unit_price[i]),
+        totalPrice: BigInt(ev.price[i]),
+        seller: ev.seller[i],
+        acc: BigInt(ev.acc[i] || 0),
+      });
+    }
+    return out;
+  });
+
+  cacheSet(cacheKey, serializeBig(list));
   return list;
 }
 
@@ -408,15 +442,17 @@ export function buildBuyTxTo(params: {
 }
 
 export async function dryRun(tx: Transaction, sender: string) {
-  tx.setSender(sender);
-  const bytes = await tx.build({ client });
-  const r = await client.dryRunTransactionBlock({ transactionBlock: bytes });
-  return {
-    status: r.effects?.status?.status,
-    error: r.effects?.status?.error,
-    gasUsed: r.effects?.gasUsed,
-    effects: r.effects,
-  };
+  return withRetry(async (c) => {
+    tx.setSender(sender);
+    const bytes = await tx.build({ client: c });
+    const r = await c.dryRunTransactionBlock({ transactionBlock: bytes });
+    return {
+      status: r.effects?.status?.status,
+      error: r.effects?.status?.error,
+      gasUsed: r.effects?.gasUsed,
+      effects: r.effects,
+    };
+  });
 }
 
 export { TYPE_PACKAGE, CALL_PACKAGE, MARKET_CALL_PACKAGE, MARKET_TYPE_PACKAGE, MOVESCRIPTION_TYPE };
