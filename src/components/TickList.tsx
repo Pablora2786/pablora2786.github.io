@@ -5,10 +5,12 @@ type Props = {
   ticks: TickInfo[];
   loading: boolean;
   onSelect: (t: TickInfo) => void;
+  /** Navigate to holders/detail for this tick (查看 button). */
+  onView?: (t: TickInfo) => void;
   selected?: string;
 };
 
-export function TickList({ ticks, loading, onSelect, selected }: Props) {
+export function TickList({ ticks, loading, onSelect, onView, selected }: Props) {
   if (loading) return <div className="card muted">加载铭文列表…</div>;
   return (
     <div className="table-wrap">
@@ -51,7 +53,13 @@ export function TickList({ ticks, loading, onSelect, selected }: Props) {
                   {t.mintFee == null ? '—' : t.mintFee === 0n ? '0' : `${mistToSui(t.mintFee)} SUI`}
                 </td>
                 <td>
-                  <button className="btn small" onClick={() => onSelect(t)}>
+                  <button
+                    className="btn small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      (onView || onSelect)(t);
+                    }}
+                  >
                     查看
                   </button>
                 </td>

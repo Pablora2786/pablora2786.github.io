@@ -38,7 +38,21 @@ export type TickInfo = {
   mintFactory: string | null;
   totalTx: bigint | null;
   marketId: string | null;
+  deployer?: string | null;
 };
+
+/** SUIS first, DGEN second, then A–Z. */
+export function pinTickOrder(a: string, b: string): number {
+  const rank = (t: string) => (t === 'SUIS' ? 0 : t === 'DGEN' ? 1 : 2);
+  const ra = rank(a);
+  const rb = rank(b);
+  if (ra !== rb) return ra - rb;
+  return a.localeCompare(b);
+}
+
+export function pinTicksFirst<T extends { tick: string }>(list: T[]): T[] {
+  return [...list].sort((a, b) => pinTickOrder(a.tick, b.tick));
+}
 
 export type MovescriptionHolding = {
   objectId: string;
@@ -130,11 +144,7 @@ export async function loadAllTicks(opts?: { deep?: boolean }): Promise<TickInfo[
     });
     await new Promise((r) => setTimeout(r, 200));
   }
-  results.sort((a, b) => {
-    if (a.tick === 'SUIS') return -1;
-    if (b.tick === 'SUIS') return 1;
-    return a.tick.localeCompare(b.tick);
-  });
+  results.sort((a, b) => pinTickOrder(a.tick, b.tick));
   cacheSet(cacheKey, serializeBig(results));
   return results;
 }

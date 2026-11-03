@@ -17,6 +17,7 @@ import {
   buildBuyTxTo,
   dryRun,
   friendlyRpcError,
+  pinTicksFirst,
 } from './lib/sui';
 import { formatAmount, formatShanghai, isValidSuiAddress, mistToSui, shortAddr } from './lib/format';
 import { SITE_NAME } from './lib/constants';
@@ -24,16 +25,39 @@ import { useSignAndExecuteTransaction } from '@mysten/dapp-kit';
 import type { Transaction } from '@mysten/sui/transactions';
 
 
-/** Keep SUIS pinned first in any tick list shown in the UI. */
-function pinSuisFirst<T extends { tick: string }>(list: T[]): T[] {
-  return [...list].sort((a, b) => {
-    if (a.tick === 'SUIS') return -1;
-    if (b.tick === 'SUIS') return 1;
-    return a.tick.localeCompare(b.tick);
-  });
+type Tab = 'ticks' | 'deploy' | 'mine' | 'market' | 'holders';
+
+const TAB_SET = new Set<Tab>(['ticks', 'deploy', 'mine', 'market', 'holders']);
+
+function parseRoute(): { tab: Tab; holdersTick: string | null } {
+  const raw = (window.location.hash || '').replace(/^#\/?/, '');
+  if (!raw) return { tab: 'ticks', holdersTick: null };
+  const holdersMatch = raw.match(/^holders(?:\/([A-Za-z0-9_]+))?$/i);
+  if (holdersMatch) {
+    return {
+      tab: 'holders',
+      holdersTick: holdersMatch[1] ? holdersMatch[1].toUpperCase() : null,
+    };
+  }
+  const tab = raw.split('/')[0].toLowerCase() as Tab;
+  if (TAB_SET.has(tab)) return { tab, holdersTick: null };
+  return { tab: 'ticks', holdersTick: null };
 }
 
-type Tab = 'ticks' | 'deploy' | 'mine' | 'market' | 'holders';
+function writeRoute(tab: Tab, holdersTick?: string | null) {
+  let next = '';
+  if (tab === 'holders') {
+    next = holdersTick ? `#/holders/${holdersTick}` : '#/holders';
+  } else if (tab !== 'ticks') {
+    next = `#/${tab}`;
+  } else {
+    next = '#/ticks';
+  }
+  if (window.location.hash !== next) {
+    window.location.hash = next;
+  }
+}
+
 
 type Pending = {
   title: string;
@@ -45,10 +69,14 @@ export default function App() {
   const account = useCurrentAccount();
   const { mutateAsync: signAndExecute } = useSignAndExecuteTransaction();
 
-  const [tab, setTab] = useState<Tab>('ticks');
+  const initialRoute = parseRoute();
+  const [tab, setTab] = useState<Tab>(initialRoute.tab);
   const [ticks, setTicks] = useState<TickInfo[]>([]);
   const [loadingTicks, setLoadingTicks] = useState(true);
   const [selected, setSelected] = useState<TickInfo | null>(null);
+  const [holdersTick, setHoldersTick] = useState<string>(
+    initialRoute.holdersTick || 'SUIS',
+  );
   const [holdings, setHoldings] = useState<MovescriptionHolding[]>([]);
   const [loadingMine, setLoadingMine] = useState(false);
   const [listings, setListings] = useState<MarketListing[]>([]);
@@ -92,8 +120,9 @@ export default function App() {
             mintFee: x.mintFee == null ? null : BigInt(x.mintFee),
             startTimeMs: x.startTimeMs == null ? null : BigInt(x.startTimeMs),
             totalTx: x.totalTx == null ? null : BigInt(x.totalTx),
+            deployer: x.deployer || null,
           }));
-          setTicks(pinSuisFirst(mapped));
+          setTicks(pinTicksFirst(mapped));
           setLoadingTicks(false);
           setSelected((prev) => {
             if (prev) return prev;
@@ -106,7 +135,7 @@ export default function App() {
       }
       if (deep) {
         const live = await loadAllTicks({ deep: true });
-        setTicks(pinSuisFirst(live));
+        setTicks(pinTicksFirst(live));
         setSelected((prev) => {
           if (prev) {
             return live.find((x) => x.tick === prev.tick) || prev;
@@ -125,6 +154,28 @@ export default function App() {
     refreshTicks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const onHash = () => {
+      const r = parseRoute();
+      setTab(r.tab);
+      if (r.holdersTick) {
+        setHoldersTick(r.holdersTick);
+        setSelected((prev) => {
+          if (prev?.tick === r.holdersTick) return prev;
+          const found = ticks.find((t) => t.tick === r.holdersTick);
+          return found || prev;
+        });
+      }
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, [ticks]);
+
+  useEffect(() => {
+    if (tab !== 'holders') return;
+    if (!holdersTick && selected?.tick) setHoldersTick(selected.tick);
+  }, [tab, holdersTick, selected]);
 
   const refreshMine = useCallback(async () => {
     if (!account) {
@@ -236,7 +287,16 @@ export default function App() {
               key={k}
               type="button"
               className={`tab-btn ${tab === k ? 'active' : ''}`}
-              onClick={() => setTab(k)}
+              onClick={() => {
+                setTab(k);
+                if (k === 'holders') {
+                  const t = holdersTick || selected?.tick || 'SUIS';
+                  setHoldersTick(t);
+                  writeRoute('holders', t);
+                } else {
+                  writeRoute(k);
+                }
+              }}
             >
               {label}
             </button>
@@ -275,6 +335,12 @@ export default function App() {
               selected={selected?.tick}
               onSelect={(t) => {
                 setSelected(t);
+              }}
+              onView={(t) => {
+                setSelected(t);
+                setHoldersTick(t.tick);
+                setTab('holders');
+                writeRoute('holders', t.tick);
               }}
             />
             {selected && (
@@ -599,7 +665,7 @@ export default function App() {
                     if (t) setSelected(t);
                   }}
                 >
-                  {pinSuisFirst(ticks.filter((t) => t.marketId)).map((t) => (
+                  {pinTicksFirst(ticks.filter((t) => t.marketId)).map((t) => (
                     <option key={t.tick} value={t.tick}>
                       {t.tick}
                     </option>
@@ -800,7 +866,25 @@ export default function App() {
         )}
 
         {tab === 'holders' && (
-          <HoldersPanel tick={selected?.tick || 'SUIS'} />
+          <HoldersPanel
+            tick={holdersTick || selected?.tick || 'SUIS'}
+            tickInfo={
+              ticks.find((t) => t.tick === (holdersTick || selected?.tick || 'SUIS')) ||
+              selected ||
+              null
+            }
+            tickOptions={
+              ticks.length
+                ? pinTicksFirst(ticks).map((t) => t.tick)
+                : ['SUIS', 'DGEN', 'MOVE', 'IKUN', 'GAME', 'SUIZ']
+            }
+            onTickChange={(t) => {
+              setHoldersTick(t);
+              const found = ticks.find((x) => x.tick === t);
+              if (found) setSelected(found);
+              writeRoute('holders', t);
+            }}
+          />
         )}
       </main>
 
