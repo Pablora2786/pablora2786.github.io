@@ -3,8 +3,9 @@
  * Build public/holders/<TICK>.json via Sui GraphQL.
  *
  * Live object pagination is pinned to a checkpoint (~1h retention). Long scans
- * hit "outside consistent range". We scan FORWARD (first/after) and BACKWARD
- * (last/before), merging by object id so the two windows cover the set.
+ * hit "outside consistent range". We scan FORWARD and BACKWARD, restarting
+ * fresh windows until the time budget or no new objects, then enrich each
+ * discovered holder via owner+type filter (fixes undercounted wallets).
  */
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
@@ -16,12 +17,15 @@ const OUT = join(ROOT, 'public', 'holders');
 const GQL = process.env.SUI_GRAPHQL_URL || 'https://graphql.mainnet.sui.io/graphql';
 const TYPE =
   '0x830fe26674dc638af7c3d84030e2575f44a2bdc1baa1f4757cfe010a4b106b6a::movescription::Movescription';
-const PAGE = Number(process.env.HOLDERS_PAGE_SIZE || 50);
-const ONLY = (process.env.HOLDERS_TICKS || 'SUIS,MOVE,IKUN,GAME,SUIZ')
+const PAGE = Math.min(50, Number(process.env.HOLDERS_PAGE_SIZE || 50));
+const ONLY = (process.env.HOLDERS_TICKS || 'SUIS,DGEN,MOVE,IKUN,GAME,SUIZ')
   .split(',')
   .map((s) => s.trim().toUpperCase())
   .filter(Boolean);
 const CHECKPOINT_EVERY = Number(process.env.HOLDERS_CHECKPOINT_EVERY || 80);
+const MAX_SEC = Number(process.env.HOLDERS_MAX_SEC || 0); // 0 = no limit
+const MAX_RESTARTS = Number(process.env.HOLDERS_MAX_RESTARTS || 6);
+const ENRICH = process.env.HOLDERS_ENRICH !== '0';
 
 function queryForward() {
   return `query($cursor: String) {
@@ -59,6 +63,22 @@ function queryBackward() {
 }`;
 }
 
+function queryOwned() {
+  return `query($owner: SuiAddress!, $cursor: String) {
+  objects(first: ${PAGE}, after: $cursor, filter: { owner: $owner, type: "${TYPE}" }) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      address
+      owner {
+        __typename
+        ... on AddressOwner { address { address } }
+      }
+      asMoveObject { contents { json } }
+    }
+  }
+}`;
+}
+
 async function gql(query, variables, tries = 12) {
   let last;
   for (let i = 0; i < tries; i++) {
@@ -89,6 +109,10 @@ async function gql(query, variables, tries = 12) {
     }
   }
   throw last;
+}
+
+function timedOut(t0) {
+  return MAX_SEC > 0 && (Date.now() - t0) / 1000 >= MAX_SEC;
 }
 
 function loadSupply() {
@@ -175,7 +199,7 @@ function writeTickPayload(tick, bucket, supply, updatedAt, meta = {}) {
   };
 }
 
-async function scanDirection(byTick, supply, direction, t0) {
+async function scanDirectionOnce(byTick, direction, t0) {
   const forward = direction === 'forward';
   const q = forward ? queryForward() : queryBackward();
   let cursor = null;
@@ -183,9 +207,10 @@ async function scanDirection(byTick, supply, direction, t0) {
   let scanned = 0;
   let added = 0;
   let finished = false;
-  console.error(JSON.stringify({ direction, event: 'start' }));
+  let rangeExceeded = false;
   try {
     for (;;) {
+      if (timedOut(t0)) break;
       const data = await gql(q, { cursor });
       const conn = data.objects;
       for (const node of conn.nodes || []) {
@@ -194,7 +219,6 @@ async function scanDirection(byTick, supply, direction, t0) {
       }
       pages++;
       if (pages % 20 === 0) {
-        const suis = byTick.SUIS;
         console.error(
           JSON.stringify({
             direction,
@@ -202,14 +226,15 @@ async function scanDirection(byTick, supply, direction, t0) {
             scanned,
             added,
             elapsedSec: Math.round((Date.now() - t0) / 1000),
-            suisHolders: suis?.holders.size || 0,
-            suisObjs: suis?.objects || 0,
-            uniqueAll: Object.values(byTick).reduce((n, b) => n + b.seen.size, 0),
+            ticks: Object.fromEntries(
+              ONLY.map((t) => [t, { holders: byTick[t].holders.size, objs: byTick[t].objects }]),
+            ),
           }),
         );
       }
       if (CHECKPOINT_EVERY && pages % CHECKPOINT_EVERY === 0) {
         const updatedAt = new Date().toISOString();
+        const supply = loadSupply();
         for (const tick of ONLY) {
           writeTickPayload(tick, byTick[tick], supply, updatedAt, {
             complete: false,
@@ -234,10 +259,101 @@ async function scanDirection(byTick, supply, direction, t0) {
   } catch (e) {
     const msg = String(e?.message || e);
     console.error(JSON.stringify({ direction, event: 'stop', message: msg, pages, scanned, added }));
-    if (!/outside consistent range|outside the available range/i.test(msg)) throw e;
+    if (/outside consistent range|outside the available range/i.test(msg)) {
+      rangeExceeded = true;
+    } else {
+      throw e;
+    }
   }
-  console.error(JSON.stringify({ direction, event: 'done', finished, pages, scanned, added }));
-  return { finished, pages, scanned, added };
+  return { finished, pages, scanned, added, rangeExceeded };
+}
+
+async function scanWithRestarts(byTick, direction, t0) {
+  let total = { finished: false, pages: 0, scanned: 0, added: 0, restarts: 0 };
+  for (let i = 0; i < MAX_RESTARTS; i++) {
+    if (timedOut(t0)) break;
+    const beforeUnique = Object.values(byTick).reduce((n, b) => n + b.seen.size, 0);
+    console.error(JSON.stringify({ direction, event: 'start', restart: i }));
+    const r = await scanDirectionOnce(byTick, direction, t0);
+    total.pages += r.pages;
+    total.scanned += r.scanned;
+    total.added += r.added;
+    total.restarts = i;
+    if (r.finished) {
+      total.finished = true;
+      break;
+    }
+    const afterUnique = Object.values(byTick).reduce((n, b) => n + b.seen.size, 0);
+    const gained = afterUnique - beforeUnique;
+    console.error(JSON.stringify({ direction, event: 'restart-check', gained, restart: i }));
+    if (!r.rangeExceeded) break;
+    if (gained === 0 && i > 0) break;
+    // brief pause so a new consistency window can open
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  console.error(JSON.stringify({ direction, event: 'done', ...total }));
+  return total;
+}
+
+/** Re-query each discovered holder so missing objects for known addresses are filled in. */
+async function enrichHolders(byTick, t0) {
+  if (!ENRICH) return { enriched: 0 };
+  const q = queryOwned();
+  let enriched = 0;
+  for (const tick of ONLY) {
+    if (timedOut(t0)) break;
+    const bucket = byTick[tick];
+    const addrs = [...bucket.holders.keys()];
+    console.error(JSON.stringify({ event: 'enrich-start', tick, addresses: addrs.length }));
+    for (let i = 0; i < addrs.length; i++) {
+      if (timedOut(t0)) break;
+      const owner = addrs[i];
+      let cursor = null;
+      let amount = 0n;
+      let objects = 0;
+      try {
+        for (;;) {
+          const data = await gql(q, { owner, cursor });
+          const conn = data.objects;
+          for (const node of conn.nodes || []) {
+            const json = node?.asMoveObject?.contents?.json;
+            if (!json?.tick || String(json.tick).toUpperCase() !== tick) continue;
+            const oid = node.address;
+            if (!oid) continue;
+            if (!bucket.seen.has(oid)) {
+              bucket.seen.add(oid);
+              bucket.objects++;
+            }
+            amount += BigInt(json.amount || 0);
+            objects += 1;
+          }
+          if (!conn.pageInfo.hasNextPage) break;
+          cursor = conn.pageInfo.endCursor;
+        }
+        if (objects > 0) {
+          bucket.holders.set(owner, { amount, objects });
+          enriched++;
+        }
+      } catch (e) {
+        console.error(JSON.stringify({ event: 'enrich-err', tick, owner, message: String(e?.message || e) }));
+      }
+      if ((i + 1) % 50 === 0) {
+        console.error(
+          JSON.stringify({
+            event: 'enrich-progress',
+            tick,
+            done: i + 1,
+            total: addrs.length,
+            elapsedSec: Math.round((Date.now() - t0) / 1000),
+          }),
+        );
+        const updatedAt = new Date().toISOString();
+        const supply = loadSupply();
+        writeTickPayload(tick, bucket, supply, updatedAt, { complete: false, coverage: { enrich: true } });
+      }
+    }
+  }
+  return { enriched };
 }
 
 async function main() {
@@ -247,8 +363,7 @@ async function main() {
   for (const t of ONLY) byTick[t] = emptyBucket();
   const t0 = Date.now();
 
-  const fwd = await scanDirection(byTick, supply, 'forward', t0);
-  // checkpoint after forward
+  const fwd = await scanWithRestarts(byTick, 'forward', t0);
   {
     const updatedAt = new Date().toISOString();
     for (const tick of ONLY) {
@@ -258,26 +373,24 @@ async function main() {
       });
     }
   }
-  const back = await scanDirection(byTick, supply, 'backward', t0);
+  const back = await scanWithRestarts(byTick, 'backward', t0);
+  const enrich = await enrichHolders(byTick, t0);
 
-  const complete = !!(fwd.finished || back.finished || (fwd.added > 0 && back.added > 0));
-  // Mark complete if either direction finished fully, or both sides contributed (best-effort cover).
+  const complete = !!(fwd.finished || back.finished);
   const updatedAt = new Date().toISOString();
   const summary = {
     updatedAt,
-    coverage: { forward: fwd, backward: back },
+    coverage: { forward: fwd, backward: back, enrich },
     ticks: {},
   };
   for (const tick of ONLY) {
     const info = writeTickPayload(tick, byTick[tick], supply, updatedAt, {
-      complete: fwd.finished && back.finished ? true : complete,
-      coverage: { forward: fwd, backward: back },
+      complete,
+      coverage: { forward: fwd, backward: back, enrich },
     });
-    // Prefer complete=true only if one direction fully finished OR sum suggests good cover
     summary.ticks[tick] = info;
     console.log('WROTE', tick, 'holders', info.holders, 'objects', info.objects);
   }
-  // If forward finished alone, that's authoritative complete
   if (fwd.finished) {
     for (const tick of ONLY) {
       const p = JSON.parse(readFileSync(join(OUT, `${tick}.json`), 'utf8'));
@@ -292,6 +405,8 @@ async function main() {
       elapsedSec: Math.round((Date.now() - t0) / 1000),
       forward: fwd,
       backward: back,
+      enrich,
+      dgen: summary.ticks.DGEN,
       suis: summary.ticks.SUIS,
     }),
   );
